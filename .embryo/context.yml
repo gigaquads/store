@@ -1,0 +1,35 @@
+---
+project/base:
+- embryo:
+    action: hatch
+    name: project/base
+    timestamp: 1620912653.487973
+  project:
+    description: ''
+    name: store
+    version: 0.0.0
+python_project/base:
+- embryo:
+    action: hatch
+    name: python_project/base
+    timestamp: 1620912657.882531
+  project: {}
+python_project/setup:
+- config:
+    find_namespace_packages: false
+    find_packages: true
+    refresh_scripts: true
+  embryo:
+    action: hatch
+    name: python_project/setup
+    timestamp: 1620912662.528934
+  metadata:
+    classifiers: []
+    keywords: []
+  options:
+    dependency_links: []
+    install_requires: []
+    packages: []
+    scripts: []
+  project: {}
+...
