@@ -1,10 +1,15 @@
+from collections import defaultdict
 from typing import (
-    Optional, Text, Any, List,
     OrderedDict as OrderedDictType,
-    Dict, Set, Iterable, Union,
-    Callable, Tuple
+    Text,
+    Any,
+    Dict,
+    Set,
+    Optional,
+    Iterable,
+    Union,
+    Callable,
 )
-from copy import deepcopy
 
 from appyratus.memoize import memoized_property
 
@@ -12,7 +17,10 @@ from .util import get_pkeys, to_dict
 from .symbol import Symbol
 from .query import Query
 from .interfaces import (
-    QueryInterface, StoreInterface, TransactionInterface, StateDictInterface
+    QueryInterface,
+    StoreInterface,
+    TransactionInterface,
+    StateDictInterface
 )
 
 
@@ -33,8 +41,9 @@ class Transaction(TransactionInterface):
         self.back: StoreInterface = back
         self.front: StoreInterface = front
         self.callback = callback
-        self.journal: List[Tuple] = []
         self.deleted_pkeys = set()
+        self.updated_pkeys = set()
+        self.created_pkeys = set()
 
     def __enter__(self):
         """
@@ -61,6 +70,20 @@ class Transaction(TransactionInterface):
             self.commit()
             return True
 
+    @property
+    def records(self) -> Dict:
+        """
+        Alias for self.front.records.
+        """
+        return self.front.records
+
+    @property
+    def pkey_name(self) -> Text:
+        """
+        Alias for self.front.pkey_name.
+        """
+        return self.front.pkey_name
+
     @memoized_property
     def row(self) -> Symbol:
         """
@@ -83,36 +106,57 @@ class Transaction(TransactionInterface):
         applied to self.front to self.back. Afterwards, apply custom "on_commit"
         callback.
         """
-        # flush journal to the backend store,
-        # replaying front store calls to the back store.
+        # flush changes to backend store,
         with self.back.lock:
-            for func_name, args, kwargs in self.journal:
-                func = getattr(self.back, func_name)
-                func(*args, **kwargs)
-
+            # flush delete statements
             if self.deleted_pkeys:
                 self.back.delete_many(self.deleted_pkeys)
 
+            # flush create statements
+            created_pkeys = self.created_pkeys - self.deleted_pkeys
+            if created_pkeys:
+                self.back.create_many(
+                    self.front.records[pkey] for pkey in created_pkeys
+                )
+
+            # flush update statements
+            updated_pkeys = self.updated_pkeys - self.deleted_pkeys
+            if updated_pkeys:
+                self.back.update_many(
+                    self.front.records[pkey] for pkey in updated_pkeys
+                )
+
             # trigger custom callback method
             if self.callback is not None:
-                self.callback(self)
+                created = {k: self.front.records[k] for k in self.created_pkeys}
+                updated = {k: self.front.records[k] for k in self.updated_pkeys}
+                deleted = self.deleted_pkeys.copy()
+                self.callback(self, created, updated, deleted)
+
+            # reinitialize transaction
+            self.clear()
 
     def rollback(self):
+        """
+        Abort the transaction.
+        """
+        self.clear()
+
+    def clear(self):
         """
         Clear internal record, reseting the Transaction to its initialized record.
         """
         self.front.clear()
-        self.journal.clear()
         self.deleted_pkeys.clear()
+        self.created_pkeys.clear()
+        self.updated_pkeys.clear()
 
     def create(self, record: Dict) -> Dict:
         """
         Insert a single record dict.
         """
-        self.journal.append(('create', deepcopy(record), {}))
-
         # create record solely in front store
-        return self.front.create(record)
+        return self.front.create(record, transaction=self)
     
     def create_many(
         self, records: Iterable[Any]
@@ -120,10 +164,8 @@ class Transaction(TransactionInterface):
         """
         Insert multiple record dicts.
         """
-        self.journal.append(('create_many', [deepcopy(records)], {}))
-
         # create records solely in front store
-        return self.front.create_many(records)
+        return self.front.create_many(records, transaction=self)
 
     def select(self, *targets: Union[Symbol.Attribute, Text]) -> QueryInterface:
         """
@@ -132,6 +174,7 @@ class Transaction(TransactionInterface):
         def merge(query: Query, back_result: Dict[Any, StateDictInterface]):
             front_query = query.copy(self.front)
             front_result = front_query.execute()
+
             if isinstance(front_result, dict):
                 back_result.update(front_result)
                 return back_result
@@ -144,7 +187,16 @@ class Transaction(TransactionInterface):
                 else:
                     return back_result
 
-        query = self.back.select(*targets)
+        # we don't want to needless fetch records from the back store, so we
+        # will construct a query that excludes any of its records' pkeys.
+        front_pkeys = (
+            self.deleted_pkeys | self.created_pkeys | self.updated_pkeys
+        )
+        # create a query for back store
+        query = self.back.select(*targets).where(
+            self.back.row[self.back.pkey_name].not_in(front_pkeys)
+        )
+        # call merge upon back query executing
         query.subscribe(merge)
 
         return query
@@ -205,18 +257,13 @@ class Transaction(TransactionInterface):
         else:
             record = target
 
-        self.journal.append(('update', (deepcopy(record), ), {'keys': keys}))
-
         pkey = record[self.front.pkey_name]
         if pkey not in self.front:
             back_state = self.back.get(pkey)
             self.front.create(back_state)
-            return self.front.update(record, keys=keys)
 
         # only update records in front store
-        record = self.front.update(record)
-        record.transaction = self
-
+        record = self.front.update(record, keys=keys, transaction=self)
         return record
 
     def update_many(
@@ -231,8 +278,6 @@ class Transaction(TransactionInterface):
             for target in targets
         ]
 
-        self.journal.append(('update_many', (deepcopy(records), ), {}))
-
         pkeys = get_pkeys(records, self.front.pkey_name, as_set=True)
         missing_pkey_set = pkeys - self.front.records.keys()
 
@@ -241,31 +286,15 @@ class Transaction(TransactionInterface):
         self.front.create_many(back_states.values())
 
         # perform updates to records solely in front store
-        records = self.front.update_many(records)
-        for record in records.values():
-            record.transaction = self
-
+        records = self.front.update_many(records, transaction=self)
         return records
 
     def delete(self, target: Any, keys: Optional[Iterable[Text]] = None):
         """
         Drop an entire record or specific keys.
         """
-        # normalize target to record dict
-        if isinstance(target, dict):
-            record = target
-        else:
-            record = to_dict(target)
-
-        pkey = get_pkeys([record], self.front.pkey_name)[0]
-
-        if not keys:
-            self.deleted_pkeys.add(pkey)
-
-        self.journal.append(('delete', (pkey, ), {}))
-
         # delete records only from font store
-        self.front.delete(pkey, keys=keys)
+        self.front.delete(target, keys=keys, transaction=self)
 
     def delete_many(
         self,
@@ -276,13 +305,5 @@ class Transaction(TransactionInterface):
         Delete multiple records from the store (or, if keys present, just remove
         the given keys from the target records).
         """
-        pkeys = get_pkeys(targets, self.front.pkey_name)
-
-        if not keys:
-            self.deleted_pkeys.update(pkeys)
-
-        self.journal.append(
-            ('delete_many', (pkeys, ), {'keys': keys})
-        )
         # delete solely from front store
-        self.front.delete_many(pkeys)
+        self.front.delete_many(targets, transaction=self)

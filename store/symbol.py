@@ -2,6 +2,7 @@
 class Symbol
 """
 
+from copy import deepcopy
 from typing import Any, Optional, Text, Iterable, Type, Dict, Union
 
 from .util import get_hashable
@@ -48,6 +49,14 @@ class SymbolicAttribute(SymbolicAttributeInterface):
     def __ne__(self, value: Any) -> ConditionalExpression:
         return ConditionalExpression(OP_CODE.NE, self, get_hashable(value))
 
+    def __deepcopy__(self, memo) -> 'SymbolicAttribute':
+        """
+        What happens on deepcopy(attr). Note that the symbol attribute is *not*
+        deep copied, as most likely, this would result in an infinite loop with
+        respect to Symbol's own __deepcopy__ method.
+        """
+        return type(self)(self.key, self.symbol)
+
     def one_of(self, value: Iterable) -> ConditionalExpression:
         """
         Example:
@@ -57,6 +66,16 @@ class SymbolicAttribute(SymbolicAttributeInterface):
         ```
         """
         return ConditionalExpression(OP_CODE.IN, self, get_hashable(value))
+
+    def not_in(self, value: Iterable) -> ConditionalExpression:
+        """
+        Example:
+        ```
+        user = store.symbol()
+        query.where(user.email.not_in(subsriber_email_list))
+        ```
+        """
+        return ConditionalExpression(OP_CODE.NOT_IN, self, get_hashable(value))
 
     @property
     def asc(self) -> OrderingInterface:
@@ -103,6 +122,9 @@ class Symbol:
     def __init__(self):
         self._attrs: Dict[Text, 'SymbolicAttribute'] = {}
 
+    def __getitem__(self, key: Text) -> 'SymbolicAttribute':
+        return getattr(self, key)
+
     def __getattr__(self, key: Text) -> 'SymbolicAttribute':
         """
         This allows the symbol to generate dynamic SymbolicAttributes via
@@ -122,3 +144,10 @@ class Symbol:
             self._attrs[key] = attr
 
         return self._attrs[key]
+
+    def __deepcopy__(self, memo) -> 'Symbol':
+        copy = type(self)()
+        copy._attrs = {
+            k: SymbolicAttribute(k, self) for k in self._attrs
+        }
+        return copy
